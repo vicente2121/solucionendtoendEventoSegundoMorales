@@ -1,0 +1,139 @@
+# ============================================================
+# GOLD STAR SCHEMA end-to-end (LK_Plata -> WH_Oro) — 1 CELDA
+# Lakehouse SIN esquema (sin dbo)
+# ============================================================
+
+from pyspark.sql import functions as F, Window
+
+# -----------------------------
+# 0) PARÁMETROS / UTILIDADES
+# -----------------------------
+WS_WH_Oro = "fed7b302-57c3-440a-bd29-16d197578402"  # GUID workspace donde vive el Warehouse
+WH_NAME   = "WH_Oro"                                 # Nombre del Warehouse
+SCHEMA    = "dbo"                                    # Esquema en el Warehouse
+SRC_LH    = "LK_Plata"                               # Lakehouse origen (SIN esquema)
+SRC_TABLA = "precios_combustibles_silver_raw"        # Tabla en el Lakehouse (sin dbo)
+
+def write_wh(df, table, mode="overwrite"):
+    (df.write
+       .mode(mode)
+       .option("WorkspaceId", WS_WH_Oro)             # cross-workspace
+       .synapsesql(f"{WH_NAME}.{SCHEMA}.{table}"))
+
+def read_wh(table):
+    return (spark.read
+                .option("WorkspaceId", WS_WH_Oro)
+                .synapsesql(f"{WH_NAME}.{SCHEMA}.{table}"))
+
+# -----------------------------
+# 1) LECTURA SILVER (Lakehouse SIN esquema)
+# -----------------------------
+silver = spark.sql(f"""
+SELECT *
+FROM {SRC_LH}.{SRC_TABLA}
+""")
+
+# Tipos + deduplicación por clave natural (última versión)
+pk = ["serie","periodo","zona_codigo","producto_codigo","proceso_codigo","unidades"]
+w  = Window.partitionBy(*pk).orderBy(
+        F.col("fecha_ingestion").desc(),
+        F.col("archivo_origen").desc()
+     )
+
+silver_clean = (silver
+    .withColumn("rn", F.row_number().over(w)).filter("rn = 1").drop("rn")
+    .withColumn("periodo", F.col("periodo").cast("date"))
+    .withColumn("valor",   F.col("valor").cast("decimal(9,4)"))
+)
+
+print(f"✅ silver_clean listo: {silver_clean.count():,} filas")
+
+# -----------------------------
+# 2) DIM FECHA (mensual)
+# -----------------------------
+mm = silver_clean.agg(F.min("periodo").alias("min_p"), F.max("periodo").alias("max_p")).first()
+
+dim_fecha = (spark.range(1)
+  .select(F.sequence(F.date_trunc("MONTH", F.lit(mm.min_p)),
+                     F.date_trunc("MONTH", F.lit(mm.max_p)),
+                     F.expr("interval 1 month")).alias("seq"))
+  .withColumn("fecha", F.explode("seq")).drop("seq")
+  .withColumn("anio",  F.year("fecha"))
+  .withColumn("mes",   F.month("fecha"))
+  .withColumn("date_key", (F.col("anio")*100+F.col("mes")).cast("int"))
+  .withColumn("anio_mes",   F.date_format("fecha","yyyy-MM"))
+  .withColumn("mes_nombre", F.date_format("fecha","MMMM"))
+  .select("date_key","fecha","anio","mes","anio_mes","mes_nombre")
+)
+
+write_wh(dim_fecha, "Dim_Fecha", "overwrite")
+print("🟢 Dim_Fecha -> WH_Oro")
+
+# -----------------------------
+# 3) DIMENSIONES (SK con xxhash64)
+# -----------------------------
+dim_area = (silver_clean.select("zona_codigo","zona_nombre").dropDuplicates(["zona_codigo"])
+    .withColumn("sk_area", F.abs(F.xxhash64("zona_codigo")).cast("bigint"))
+    .select("sk_area","zona_codigo","zona_nombre"))
+
+dim_producto = (silver_clean.select("producto_codigo","producto_nombre").dropDuplicates(["producto_codigo"])
+    .withColumn("sk_producto", F.abs(F.xxhash64("producto_codigo")).cast("bigint"))
+    .select("sk_producto","producto_codigo","producto_nombre"))
+
+dim_proceso = (silver_clean.select("proceso_codigo","proceso_nombre").dropDuplicates(["proceso_codigo"])
+    .withColumn("sk_proceso", F.abs(F.xxhash64("proceso_codigo")).cast("bigint"))
+    .select("sk_proceso","proceso_codigo","proceso_nombre"))
+
+dim_serie = (silver_clean.select("serie").dropDuplicates()
+    .withColumn("sk_serie", F.abs(F.xxhash64("serie")).cast("bigint"))
+    .select("sk_serie","serie"))
+
+write_wh(dim_area,     "Dim_Area",     "overwrite")
+write_wh(dim_producto, "Dim_Producto", "overwrite")
+write_wh(dim_proceso,  "Dim_Proceso",  "overwrite")
+write_wh(dim_serie,    "Dim_Serie",    "overwrite")
+print("🟢 Dim_Area / Dim_Producto / Dim_Proceso / Dim_Serie -> WH_Oro")
+
+# -----------------------------
+# 4) FACT + métricas (MoM, YoY, SMAs)
+# -----------------------------
+base = (silver_clean
+  .join(dim_area.select("sk_area","zona_codigo"),            "zona_codigo","left")
+  .join(dim_producto.select("sk_producto","producto_codigo"), "producto_codigo","left")
+  .join(dim_proceso.select("sk_proceso","proceso_codigo"),    "proceso_codigo","left")
+  .join(dim_serie.select("sk_serie","serie"),                 "serie","left")
+  .withColumn("anio", F.year("periodo"))
+  .withColumn("mes",  F.month("periodo"))
+  .withColumn("date_key", (F.col("anio")*100+F.col("mes")).cast("int"))
+  .select("date_key","periodo","anio","mes",
+          "sk_serie","sk_area","sk_producto","sk_proceso",
+          "valor","unidades")
+)
+
+w_fact = Window.partitionBy("sk_serie","sk_area","sk_producto","sk_proceso").orderBy("periodo")
+
+fact = (base
+  .withColumn("v_prev_1",  F.lag("valor",1).over(w_fact))
+  .withColumn("v_prev_12", F.lag("valor",12).over(w_fact))
+  .withColumn("delta_mom", F.col("valor")-F.col("v_prev_1"))
+  .withColumn("delta_yoy", F.col("valor")-F.col("v_prev_12"))
+  .withColumn("pct_mom",   F.when(F.col("v_prev_1").isNotNull(),
+                                  (F.col("valor")-F.col("v_prev_1"))/F.col("v_prev_1")))
+  .withColumn("pct_yoy",   F.when(F.col("v_prev_12").isNotNull(),
+                                  (F.col("valor")-F.col("v_prev_12"))/F.col("v_prev_12")))
+  .withColumn("sma_3",  F.avg("valor").over(w_fact.rowsBetween(-2,0)))
+  .withColumn("sma_12", F.avg("valor").over(w_fact.rowsBetween(-11,0)))
+  .select("date_key","periodo","anio","mes",
+          "sk_serie","sk_area","sk_producto","sk_proceso",
+          "valor","unidades","delta_mom","delta_yoy","pct_mom","pct_yoy","sma_3","sma_12")
+)
+
+write_wh(fact, "Fact_Precios_Combustibles_Mensual", "overwrite")
+print("🟢 Fact_Precios_Combustibles_Mensual -> WH_Oro")
+
+# -----------------------------
+# 5) VERIFICACIÓN (lee del WH)
+# -----------------------------
+for t in ["Dim_Fecha","Dim_Area","Dim_Producto","Dim_Proceso","Dim_Serie","Fact_Precios_Combustibles_Mensual"]:
+    cnt = read_wh(t).limit(100).count()
+    print(f"🔎 Muestra {t}: {cnt} filas")
