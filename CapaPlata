@@ -1,0 +1,103 @@
+from pyspark.sql import functions as F
+
+# =========================
+# 0) Verifica DB actual (debe ser el DB del Lakehouse Silver: LK_Plata)
+# =========================
+print("DB actual:", spark.catalog.currentDatabase())
+# Si no es el correcto, descomenta y pon el nombre exacto del DB de tu Lakehouse:
+# spark.sql("USE `LK_Plata`")
+
+# =========================
+# 1) Leer Bronze DESDE ABFSS
+# =========================
+bronze_glob = ("abfss://Chara2308Bronce@onelake.dfs.fabric.microsoft.com/"
+               "LK_Bronce.Lakehouse/Files/bronze/year_*/month_*/data_*.json")
+
+bronze_df = (spark.read.json(bronze_glob)
+             .withColumn("archivo_origen", F.input_file_name())
+             .withColumn("fecha_ingestion", F.current_timestamp()))
+
+# Explosión del array response.data
+data_df = (bronze_df
+           .select(F.col("response.data").alias("datos"), "archivo_origen", "fecha_ingestion")
+           .withColumn("fila", F.explode("datos"))
+           .select("fila.*", "archivo_origen", "fecha_ingestion"))
+
+# =========================
+# 2) Normalización y tipado (columnas en castellano)
+# =========================
+silver_df = (data_df
+    .withColumnRenamed("area-name", "zona_nombre")
+    .withColumnRenamed("product-name", "producto_nombre")
+    .withColumnRenamed("process-name", "proceso_nombre")
+    .withColumn("periodo", F.to_date(F.concat_ws("-", F.col("period"), F.lit("01"))))  # YYYY-MM -> DATE
+    .withColumn("valor", F.col("value").cast("decimal(9,4)"))
+    .withColumn("anio", F.year("periodo"))
+    .withColumn("mes", F.month("periodo"))
+    .withColumn("hash_registro",
+        F.sha2(F.concat_ws("||",
+            F.coalesce(F.col("series"), F.lit("")),
+            F.coalesce(F.date_format("periodo","yyyy-MM-dd"), F.lit("")),
+            F.coalesce(F.col("duoarea"), F.lit("")),
+            F.coalesce(F.col("product"), F.lit("")),
+            F.coalesce(F.col("process"), F.lit("")),
+            F.coalesce(F.col("valor").cast("string"), F.lit("")),
+            F.coalesce(F.col("units"), F.lit(""))), 256)
+    )
+)
+
+# =========================
+# 3) Crear TABLA DELTA gestionada (si no existe) — SIN LOCATION
+#    (Fabric requiere MANAGED tables para CREATE TABLE)
+# =========================
+spark.sql("""
+CREATE TABLE IF NOT EXISTS precios_combustibles_silver_raw (
+  serie STRING,
+  periodo DATE,
+  zona_codigo STRING,
+  zona_nombre STRING,
+  producto_codigo STRING,
+  producto_nombre STRING,
+  proceso_codigo STRING,
+  proceso_nombre STRING,
+  valor DECIMAL(9,4),
+  unidades STRING,
+  fecha_ingestion TIMESTAMP,
+  archivo_origen STRING,
+  anio INT,
+  mes INT,
+  hash_registro STRING
+)
+USING delta
+PARTITIONED BY (anio)
+""")
+
+# =========================
+# 4) Escribir APPEND-ONLY a la tabla (sin vistas, sin dedupe)
+# =========================
+(silver_df
+ .selectExpr("series as serie",
+             "periodo",
+             "duoarea as zona_codigo",
+             "zona_nombre",
+             "product as producto_codigo",
+             "producto_nombre",
+             "process as proceso_codigo",
+             "proceso_nombre",
+             "valor",
+             "units as unidades",
+             "fecha_ingestion",
+             "archivo_origen",
+             "anio",
+             "mes",
+             "hash_registro")
+ .write
+ .mode("append")          # <- append-only
+ .insertInto("precios_combustibles_silver_raw")
+)
+
+# =========================
+# 5) Mantenimiento (opcional)
+# =========================
+spark.sql("OPTIMIZE precios_combustibles_silver_raw")
+spark.sql("VACUUM precios_combustibles_silver_raw RETAIN 168 HOURS")
